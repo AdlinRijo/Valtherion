@@ -1,10 +1,12 @@
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
+import discord
 
 from commands.guild import (
     MemberDirectoryView,
@@ -15,7 +17,8 @@ from commands.guild import (
 )
 from commands.item import ITEM_GUIDE_URL, ItemCommands, item_embed
 from commands.news import NewsCommands
-from config import Settings
+from commands.world_events import WorldEventAnnouncements
+from config import Settings, _channel_id, _excluded_events
 from main import GuildCompanionBot
 from services.news_service import NewsService
 from services.wynncraft_api import WynncraftAPI, WynncraftAPIError
@@ -103,6 +106,15 @@ class WynncraftAPITests(unittest.IsolatedAsyncioTestCase):
         for response, expected in (
             (FakeResponse(status=404, payload={"detail": "missing"}), "No matching"),
             (FakeResponse(status=429, headers={"Retry-After": "12"}), "12 seconds"),
+            (
+                FakeResponse(
+                    status=400,
+                    payload={
+                        "detail": "Malformed token in Authorization header."
+                    },
+                ),
+                "Wynncraft rejected WYNNCRAFT_API_TOKEN",
+            ),
         ):
             api = WynncraftAPI(test_settings())
             api.session = FakeSession(response)  # type: ignore[assignment]
@@ -163,6 +175,345 @@ class WynncraftAPITests(unittest.IsolatedAsyncioTestCase):
                 else:
                     await api.get_latest_articles()
 
+    async def test_loads_world_events_and_rejects_invalid_shape(self) -> None:
+        api = WynncraftAPI(test_settings())
+        session = FakeSession(FakeResponse(payload=[{"name": "Event"}]))
+        api.session = session  # type: ignore[assignment]
+
+        self.assertEqual(await api.get_world_events(), [{"name": "Event"}])
+        self.assertTrue(session.requests[0][0][0].endswith("/map/world-events"))
+
+        invalid_api = WynncraftAPI(test_settings())
+        invalid_api.session = FakeSession(
+            FakeResponse(payload={"events": []})
+        )  # type: ignore[assignment]
+        with self.assertRaisesRegex(WynncraftAPIError, "world event"):
+            await invalid_api.get_world_events()
+
+    async def test_loads_map_markers_and_rejects_invalid_shape(self) -> None:
+        api = WynncraftAPI(test_settings())
+        session = FakeSession(
+            FakeResponse(payload=[{"name": "Ragni", "x": "0", "y": "64", "z": "0"}])
+        )
+        api.session = session  # type: ignore[assignment]
+
+        self.assertEqual(
+            await api.get_map_markers(),
+            [{"name": "Ragni", "x": "0", "y": "64", "z": "0"}],
+        )
+        self.assertTrue(
+            session.requests[0][0][0].endswith("/map/locations/markers")
+        )
+
+        invalid_api = WynncraftAPI(test_settings())
+        invalid_api.session = FakeSession(FakeResponse(payload={}))  # type: ignore[assignment]
+        with self.assertRaisesRegex(WynncraftAPIError, "map marker"):
+            await invalid_api.get_map_markers()
+
+
+class WorldEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_config_parses_channel_and_excluded_event_names(self) -> None:
+        self.assertEqual(_channel_id("123456"), 123456)
+        self.assertIsNone(_channel_id(""))
+        self.assertEqual(
+            _excluded_events("Event One, deadbeef , "),
+            frozenset({"event one", "deadbeef"}),
+        )
+        with self.assertRaisesRegex(ValueError, "WORLD_EVENT_CHANNEL_ID"):
+            _channel_id("not-a-channel")
+
+    async def test_announces_upcoming_events_once_and_skips_excluded_events(self) -> None:
+        now = datetime.now(timezone.utc)
+        upcoming = (now + timedelta(minutes=10)).isoformat()
+        recent = (now - timedelta(minutes=1)).isoformat()
+        future = (now + timedelta(minutes=20)).isoformat()
+        old = (now - timedelta(minutes=10)).isoformat()
+
+        class API:
+            events = [
+                {
+                    "name": "Upcoming Event",
+                    "internalName": "upcoming",
+                    "lore": "The event is about to begin.",
+                    "difficulty": "HARD",
+                    "level": 50,
+                    "schedule": upcoming,
+                    "length": "SHORT",
+                    "location": [{"event": {"x": 10, "y": 20, "z": 30}}],
+                },
+                {
+                    "name": "Excluded Event",
+                    "internalName": "excluded",
+                    "schedule": recent,
+                },
+                {
+                    "name": "Future Event",
+                    "internalName": "future",
+                    "schedule": future,
+                },
+                {
+                    "name": "Old Event",
+                    "internalName": "old",
+                    "schedule": old,
+                },
+                {
+                    "name": "Already Started Event",
+                    "internalName": "started",
+                    "schedule": recent,
+                },
+            ]
+
+            async def get_world_events(self) -> list[dict[str, Any]]:
+                return self.events
+
+        class FakeChannel:
+            def __init__(self) -> None:
+                self.send = AsyncMock()
+                self.fetch_message = AsyncMock()
+
+        class FakeMessage:
+            id = 42
+
+            def __init__(self) -> None:
+                self.delete = AsyncMock()
+
+        api = API()
+        channel = FakeChannel()
+        message = FakeMessage()
+        channel.send.return_value = message
+        channel.fetch_message.return_value = message
+        bot = SimpleNamespace(
+            get_channel=lambda _: channel,
+            fetch_channel=AsyncMock(),
+        )
+        settings = replace(
+            test_settings(),
+            world_event_channel_id=123,
+            world_event_excluded_events=frozenset({"excluded event"}),
+        )
+        cog = WorldEventAnnouncements(bot, api, settings)  # type: ignore[arg-type]
+
+        with patch("commands.world_events.discord.TextChannel", FakeChannel):
+            await cog.poll_once()
+            await cog.poll_once()
+
+        channel.send.assert_awaited_once()
+        embed = channel.send.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "🌍 World Event: Upcoming Event")
+        self.assertEqual(
+            [field.name for field in embed.fields],
+            ["Starts", "Event", "Location"],
+        )
+        self.assertIn(":R>", embed.fields[0].value)
+        self.assertIn("X 10 · Y 20 · Z 30", embed.fields[2].value)
+        self.assertNotIn("Ragni", embed.fields[2].value)
+        self.assertTrue(all(not field.inline for field in embed.fields))
+
+        announcement = next(iter(cog.announcements.values()))
+        self.assertEqual(announcement.message_id, 42)
+        self.assertEqual(announcement.expected_start, datetime.fromisoformat(upcoming))
+        self.assertEqual(announcement.state, "announced")
+
+        # Disappearance from the response and a passed schedule are not proof of start.
+        with patch("commands.world_events.discord.TextChannel", FakeChannel):
+            api.events = []
+            await cog.poll_once()
+            message.delete.assert_not_awaited()
+            api.events = [
+                {
+                    "name": "Upcoming Event",
+                    "internalName": "upcoming",
+                    "schedule": recent,
+                    "location": [{"event": {"x": 10, "y": 20, "z": 30}}],
+                }
+            ]
+            await cog.poll_once()
+            message.delete.assert_not_awaited()
+            api.events = [
+                {
+                    "name": "Upcoming Event",
+                    "internalName": "upcoming",
+                    "active": True,
+                    "location": [{"event": {"x": 10, "y": 20, "z": 30}}],
+                }
+            ]
+            await cog.poll_once()
+            message.delete.assert_not_awaited()
+            api.events = [
+                {
+                    "name": "Upcoming Event",
+                    "internalName": "upcoming",
+                    "schedule": upcoming,
+                    "active": True,
+                    "location": [{"event": {"x": 10, "y": 20, "z": 30}}],
+                }
+            ]
+            await cog.poll_once()
+        message.delete.assert_awaited_once()
+        self.assertEqual(announcement.state, "deleted")
+
+    async def test_deletes_close_events_by_identity_when_schedules_change(self) -> None:
+        scheduled = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        locations = {
+            "first": [{"event": {"x": 10, "y": 20, "z": 30}}],
+            "second": [{"event": {"x": 40, "y": 20, "z": 50}}],
+        }
+
+        class API:
+            events = [
+                {
+                    "name": "Same Display Name",
+                    "internalName": event_id,
+                    "schedule": scheduled,
+                    "location": locations[event_id],
+                }
+                for event_id in ("first", "second")
+            ]
+
+            async def get_world_events(self) -> list[dict[str, Any]]:
+                return self.events
+
+        class FakeMessage:
+            def __init__(self, message_id: int) -> None:
+                self.id = message_id
+                self.delete = AsyncMock()
+
+        class FakeChannel:
+            def __init__(self) -> None:
+                self.messages: dict[int, FakeMessage] = {}
+                self.next_id = 100
+
+            async def send(self, **_: Any) -> FakeMessage:
+                message = FakeMessage(self.next_id)
+                self.messages[message.id] = message
+                self.next_id += 1
+                return message
+
+            async def fetch_message(self, message_id: int) -> FakeMessage:
+                return self.messages[message_id]
+
+        api = API()
+        channel = FakeChannel()
+        bot = SimpleNamespace(
+            get_channel=lambda _: channel,
+            fetch_channel=AsyncMock(),
+        )
+        settings = replace(test_settings(), world_event_channel_id=123)
+        cog = WorldEventAnnouncements(bot, api, settings)  # type: ignore[arg-type]
+
+        with patch("commands.world_events.discord.TextChannel", FakeChannel):
+            await cog.poll_once()
+            self.assertEqual(len(cog.announcements), 2)
+            api.events = [
+                {
+                    "name": "Same Display Name",
+                    "internalName": event_id,
+                    "schedule": scheduled,
+                    "active": True,
+                    "location": locations[event_id],
+                }
+                for event_id in ("first", "second")
+            ]
+            await cog.poll_once()
+
+        self.assertEqual(
+            {item.state for item in cog.announcements.values()},
+            {"deleted"},
+        )
+        self.assertEqual(
+            [message.delete.await_count for message in channel.messages.values()],
+            [1, 1],
+        )
+
+    async def test_transient_delete_failure_is_retried_with_backoff(self) -> None:
+        scheduled = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        event = {
+            "name": "Retry Event",
+            "internalName": "retry-event",
+            "schedule": scheduled,
+            "location": [{"event": {"x": 10, "y": 20, "z": 30}}],
+        }
+
+        class API:
+            events = [event]
+
+            async def get_world_events(self) -> list[dict[str, Any]]:
+                return self.events
+
+        class FakeMessage:
+            id = 777
+
+            def __init__(self) -> None:
+                self.delete = AsyncMock()
+
+        class FakeChannel:
+            def __init__(self) -> None:
+                self.message = FakeMessage()
+                self.send = AsyncMock(return_value=self.message)
+                self.fetch_message = AsyncMock(return_value=self.message)
+
+        api = API()
+        channel = FakeChannel()
+        bot = SimpleNamespace(
+            get_channel=lambda _: channel,
+            fetch_channel=AsyncMock(),
+        )
+        settings = replace(test_settings(), world_event_channel_id=123)
+        cog = WorldEventAnnouncements(bot, api, settings)  # type: ignore[arg-type]
+
+        with patch("commands.world_events.discord.TextChannel", FakeChannel):
+            await cog.poll_once()
+            api.events = [{**event, "active": True}]
+            http_error = discord.HTTPException(
+                SimpleNamespace(status=500, reason="server error", headers={}),
+                "temporary Discord failure",
+            )
+            channel.message.delete.side_effect = [
+                http_error,
+                None,
+            ]
+            await cog.poll_once()
+            announcement = next(iter(cog.announcements.values()))
+            self.assertEqual(announcement.state, "delete_pending")
+            self.assertEqual(announcement.delete_attempts, 1)
+            self.assertEqual(
+                announcement.next_delete_attempt,
+                announcement.started_confirmed_at + timedelta(seconds=5),
+            )
+            await cog._retry_confirmed_deletions(
+                announcement.next_delete_attempt
+            )
+
+        self.assertEqual(announcement.state, "deleted")
+        self.assertEqual(channel.message.delete.await_count, 2)
+
+    async def test_missing_schedule_is_not_announced_or_used_as_start_signal(self) -> None:
+        class API:
+            async def get_world_events(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "name": "Unscheduled Event",
+                        "internalName": "unscheduled",
+                        "active": True,
+                    }
+                ]
+
+        class FakeChannel:
+            send = AsyncMock()
+
+        channel = FakeChannel()
+        bot = SimpleNamespace(
+            get_channel=lambda _: channel,
+            fetch_channel=AsyncMock(),
+        )
+        settings = replace(test_settings(), world_event_channel_id=123)
+        cog = WorldEventAnnouncements(bot, API(), settings)  # type: ignore[arg-type]
+
+        with patch("commands.world_events.discord.TextChannel", FakeChannel):
+            await cog.poll_once()
+
+        channel.send.assert_not_awaited()
+        self.assertEqual(cog.announcements, {})
 
 class ItemAndNewsTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_registers_each_command_module(self) -> None:
@@ -191,6 +542,7 @@ class ItemAndNewsTests(unittest.IsolatedAsyncioTestCase):
             news = bot.tree.get_command("news")
             self.assertIsNotNone(news)
             self.assertIsNotNone(news.get_command("latest"))
+            self.assertIsNotNone(bot.get_cog("WorldEventAnnouncements"))
             bot.tree.sync.assert_awaited_once()
         finally:
             await bot.close()

@@ -26,6 +26,38 @@ between runs.
 The `/guild info` embed also lists `/item name`, `/news latest`, and `/valt help`
 under **Companion tools**.
 
+## World event announcements
+
+Set `WORLD_EVENT_CHANNEL_ID` to the numeric ID of a text channel or thread where
+the bot can view and send messages. Enable Discord Developer Mode, right-click
+the desired channel, and choose **Copy Channel ID**. The bot polls the Wynncraft
+world-events endpoint every 30 seconds and posts an announcement as soon as an
+event appears in the upcoming schedule, normally up to 15 minutes before it
+starts. Wynncraft's shared API cache can keep the response unchanged for up to
+two minutes. The embed shows the local start time, relative countdown, and
+location coordinates.
+
+An announcement is deleted only when the API response explicitly confirms a
+started/active state (or provides an actual start timestamp). A scheduled time
+passing, an event disappearing from the response, or a missing status does not
+confirm that it started. The documented Wynncraft world-events response currently
+provides schedules but does not guarantee an active-state field, so messages
+remain if no reliable start status is returned. If a schedule disappears, an
+actual start timestamp must match the stored occurrence; ambiguous updates keep
+the message. Events already confirmed as started are not announced. The bot
+needs **Manage Messages** in the channel.
+
+Pending announcements and deletion retries are held in memory only, with no
+database. Discord deletion failures are logged and retried with exponential
+backoff capped at five minutes. Restarting the bot clears this tracking and may
+leave a posted message behind.
+
+Use `WORLD_EVENT_EXCLUDED` for a comma-separated list of event names or internal
+names that should not be announced. Matching ignores case. Leave it empty to
+receive all events. Leave `WORLD_EVENT_CHANNEL_ID` unset to disable announcements.
+Upcoming schedules and duplicate protection are kept in memory, so a bot that is
+offline for the full schedule visibility window can miss that announcement.
+
 ### Command modules and Discord sync
 
 Each slash command has its own module under `commands/`: guild subcommands are
@@ -59,7 +91,8 @@ Requires Python 3.11+.
 3. Configure `DISCORD_TOKEN`, `GUILD_NAME`, and `GUILD_TAG` in your environment
    or a local `.env` file. `.env` is ignored by Git. Set `WYNNCRAFT_API_TOKEN`
    only if using an API token; embed colors can be set with `ACCENT_COLOR` and
-   `SUCCESS_COLOR`.
+   `SUCCESS_COLOR`. For world event alerts, configure `WORLD_EVENT_CHANNEL_ID`
+   and optionally `WORLD_EVENT_EXCLUDED`.
 4. Install and run on Windows:
 
    ```powershell
@@ -96,6 +129,7 @@ The HTTP session closes on normal shutdown.
 - [Player profile](https://docs.wynncraft.com/modules/player/get-player)
 - [Item search](https://docs.wynncraft.com/modules/item-recipe/quick-search-items)
 - [Published articles](https://docs.wynncraft.com/modules/news/list-publisher-articles)
+- [World events](https://docs.wynncraft.com/modules/map/list-world-events)
 - [Wynncraft Item Guide](https://wynncraft.com/help/item-guide)
 - [API privacy rules](https://docs.wynncraft.com/privacy)
 - [Authentication](https://docs.wynncraft.com/authentication)
@@ -108,3 +142,5 @@ The HTTP session closes on normal shutdown.
 | `WYNNCRAFT_API_TOKEN` | Optional Wynncraft API token |
 | `GUILD_NAME` / `GUILD_TAG` | Guild identity |
 | `ACCENT_COLOR` / `SUCCESS_COLOR` | Hex RGB embed colors |
+| `WORLD_EVENT_CHANNEL_ID` | Optional Discord text channel or thread ID for world event alerts |
+| `WORLD_EVENT_EXCLUDED` | Optional comma-separated event names/internal names to skip |

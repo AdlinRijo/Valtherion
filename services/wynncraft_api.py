@@ -77,6 +77,26 @@ class WynncraftAPI:
             )
         return payload
 
+    async def get_world_events(self) -> list[dict[str, Any]]:
+        payload = await self.get("/map/world-events")
+        if not isinstance(payload, list) or any(
+            not isinstance(event, dict) for event in payload
+        ):
+            raise WynncraftAPIError(
+                "Wynncraft returned an unexpected world event response."
+            )
+        return payload
+
+    async def get_map_markers(self) -> list[dict[str, Any]]:
+        payload = await self.get("/map/locations/markers")
+        if not isinstance(payload, list) or any(
+            not isinstance(marker, dict) for marker in payload
+        ):
+            raise WynncraftAPIError(
+                "Wynncraft returned an unexpected map marker response."
+            )
+        return payload
+
     async def get(
         self, path: str, params: dict[str, str] | None = None
     ) -> Any:
@@ -115,6 +135,15 @@ class WynncraftAPI:
                     detail = payload.get("detail") if isinstance(payload, dict) else None
                     if response.status == 404:
                         raise WynncraftAPIError("No matching public Wynncraft record was found.")
+                    if (
+                        isinstance(detail, str)
+                        and "malformed token" in detail.casefold()
+                    ):
+                        raise WynncraftAPIError(
+                            "Wynncraft rejected WYNNCRAFT_API_TOKEN. Check that "
+                            "the value in .env is a valid Wynncraft API token; "
+                            "the bot adds the Bearer authorization prefix automatically."
+                        )
                     raise WynncraftAPIError(
                         detail or f"Wynncraft API returned HTTP {response.status}."
                     )
