@@ -1,20 +1,13 @@
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from config import Settings
-from database.database import Database
 from services.wynncraft_api import WynncraftAPI
 
 RANK_ORDER = ("owner", "chief", "strategist", "recruiter", "recruit")
 
 
 class GuildService:
-    def __init__(
-        self, api: WynncraftAPI, database: Database, settings: Settings
-    ) -> None:
+    def __init__(self, api: WynncraftAPI) -> None:
         self.api = api
-        self.database = database
-        self.settings = settings
 
     async def current(self) -> dict[str, Any]:
         return await self.api.get_guild()
@@ -61,47 +54,3 @@ class GuildService:
             ):
                 owned[territory_name] = territory
         return owned
-
-    async def capture_snapshot(self) -> None:
-        guild = await self.current()
-        territories = await self.api.get_territories()
-        owned = {
-            territory_name: territory
-            for territory_name, territory in territories.items()
-            if isinstance(territory, dict)
-            and isinstance(territory.get("guild"), dict)
-            and territory["guild"].get("uuid") == guild.get("uuid")
-        }
-        member_rows = _member_rows(guild)
-        await self.database.save_snapshot(guild, member_rows, owned)
-
-    async def history(self, period: str) -> dict[str, Any]:
-        days = 1 if period == "day" else 7
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        baselines = await self.database.snapshots_before(cutoff)
-        all_rows = await self.database.all_snapshots()
-        return {
-            "baseline": baselines[0] if baselines else None,
-            "first": all_rows[0] if all_rows else None,
-            "days": days,
-        }
-
-
-def _member_rows(guild: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = []
-    member_data = guild.get("members", {})
-    if not isinstance(member_data, dict):
-        return rows
-    for rank in RANK_ORDER:
-        members = member_data.get(rank, {})
-        if isinstance(members, dict):
-            for username, member in members.items():
-                if isinstance(member, dict):
-                    rows.append(
-                        {
-                            **member,
-                            "username": member.get("username", username),
-                            "rank": rank,
-                        }
-                    )
-    return rows

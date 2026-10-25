@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -23,7 +22,6 @@ class Settings:
     guild_tag: str
     accent_color: int
     success_color: int
-    database_path: str
     api_base_url: str = "https://api.wynncraft.com/v3"
 
     @property
@@ -42,7 +40,4 @@ settings = Settings(
     guild_tag=os.getenv("GUILD_TAG", "MY GUILD TAG").strip(),
     accent_color=_color(os.getenv("ACCENT_COLOR", "8B5CF6"), 0x8B5CF6),
     success_color=_color(os.getenv("SUCCESS_COLOR", "2ECC71"), 0x2ECC71),
-    database_path=os.getenv(
-        "DATABASE_PATH", str(Path("database") / "guild_history.sqlite3")
-    ),
 )

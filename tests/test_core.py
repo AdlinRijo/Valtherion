@@ -1,20 +1,23 @@
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
 
 from commands.guild import (
-    GuildCommands,
     MemberDirectoryView,
     TerritoryView,
+    base_embed,
     format_number,
+    guild,
 )
+from commands.item import ITEM_GUIDE_URL, ItemCommands, item_embed
+from commands.news import NewsCommands
 from config import Settings
-from database.database import Database
+from main import GuildCompanionBot
+from services.news_service import NewsService
 from services.wynncraft_api import WynncraftAPI, WynncraftAPIError
 
 
@@ -43,9 +46,11 @@ class FakeSession:
     def __init__(self, response: FakeResponse | Exception) -> None:
         self.response = response
         self.calls = 0
+        self.requests: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    def get(self, *_: Any, **__: Any) -> FakeResponse:
+    def get(self, *args: Any, **kwargs: Any) -> FakeResponse:
         self.calls += 1
+        self.requests.append((args, kwargs))
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
@@ -59,7 +64,6 @@ def test_settings() -> Settings:
         guild_tag="EXG",
         accent_color=0x8B5CF6,
         success_color=0x2ECC71,
-        database_path="unused.sqlite3",
     )
 
 
@@ -117,53 +121,221 @@ class WynncraftAPITests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(WynncraftAPIError, "unexpected guild response"):
             await api.get_guild()
 
+    async def test_searches_items_and_loads_published_news(self) -> None:
+        item_api = WynncraftAPI(test_settings())
+        item_session = FakeSession(
+            FakeResponse(payload=[{"displayName": "The Item"}])
+        )
+        item_api.session = item_session  # type: ignore[assignment]
+        self.assertEqual(
+            await item_api.search_items("The Item"),
+            [{"displayName": "The Item"}],
+        )
+        self.assertTrue(
+            item_session.requests[0][0][0].endswith("/item/search/The%20Item")
+        )
 
-class PersistenceAndPresentationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_snapshot_round_trip_and_cutoff(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            database = Database(str(Path(tmp) / "history.sqlite3"))
-            await database.initialize()
-            await database.save_snapshot(
-                {
-                    "level": 20,
-                    "xpPercent": 40,
-                    "members": {"total": 1},
-                    "territories": 3,
-                    "wars": 7,
-                    "raids": 2,
-                },
-                [{"username": "ExamplePlayer", "contributed": 120}],
-                {"Ragni": {"acquired": "2026-01-01T00:00:00Z"}},
+        news_api = WynncraftAPI(test_settings())
+        news_api.session = FakeSession(
+            FakeResponse(
+                payload={
+                    "results": {
+                        "1": {"title": "News", "visible": True},
+                    }
+                }
             )
-            rows = await database.all_snapshots()
-            self.assertEqual(rows[0]["members"][0]["contributed"], 120)
-            self.assertIn("Ragni", rows[0]["territories"])
-            self.assertEqual(rows[0]["guild_level"], 20)
-            await database.close()
+        )  # type: ignore[assignment]
+        self.assertEqual(
+            await news_api.get_latest_articles(),
+            [{"title": "News", "visible": True}],
+        )
 
+    async def test_api_rejects_unexpected_item_and_news_shapes(self) -> None:
+        for method, response in (
+            ("search_items", FakeResponse(payload={"results": []})),
+            ("get_latest_articles", FakeResponse(payload={"results": []})),
+        ):
+            api = WynncraftAPI(test_settings())
+            api.session = FakeSession(response)  # type: ignore[assignment]
+            with self.assertRaisesRegex(WynncraftAPIError, "unexpected"):
+                if method == "search_items":
+                    await api.search_items("sword")
+                else:
+                    await api.get_latest_articles()
+
+
+class ItemAndNewsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_registers_each_command_module(self) -> None:
+        bot = GuildCompanionBot()
+        bot.api.start = AsyncMock()
+        bot.tree.sync = AsyncMock()
+        try:
+            await bot.setup_hook()
+            guild_command = bot.tree.get_command("guild")
+            self.assertIsNotNone(guild_command)
+            self.assertEqual(
+                {command.name for command in guild_command.commands},
+                {
+                    "info",
+                    "leaderboard",
+                    "member",
+                    "members",
+                    "refresh",
+                    "territories",
+                },
+            )
+            valt = bot.tree.get_command("valt")
+            self.assertIsNotNone(valt)
+            self.assertIsNotNone(valt.get_command("help"))
+            self.assertIsNotNone(bot.tree.get_command("item"))
+            news = bot.tree.get_command("news")
+            self.assertIsNotNone(news)
+            self.assertIsNotNone(news.get_command("latest"))
+            bot.tree.sync.assert_awaited_once()
+        finally:
+            await bot.close()
+
+    async def test_item_embed_includes_details_and_item_guide_link(self) -> None:
+        embed = item_embed(
+            {
+                "displayName": "Example Blade",
+                "internalName": "Example_Blade",
+                "type": "weapon",
+                "subType": "dagger",
+                "tier": "legendary",
+                "emblem": "diamond_5",
+                "icon": {
+                    "format": "attribute",
+                    "value": {
+                        "name": "dagger.example",
+                        "id": "minecraft:item",
+                        "customModelData": {"rangeDispatch": [42]},
+                    },
+                },
+                "requirements": {"level": 90, "dexterity": 50},
+                "identifications": {"walkSpeed": {"min": 10, "raw": 15, "max": 20}},
+                "base": {"baseDamage": {"min": 100, "raw": 100, "max": 150}},
+                "majorIds": {"Quick Strike": "<span>Deal more damage</span>"},
+                "lore": "<span>A sharp blade</span>",
+            },
+            0x123456,
+        )
+
+        self.assertEqual(embed.title, "Example Blade")
+        self.assertEqual(embed.url, ITEM_GUIDE_URL)
+        self.assertIn("weapon", embed.description)
+        fields = {field.name: field.value for field in embed.fields}
+        self.assertIn("Level", fields["Requirements"])
+        self.assertIn("Walk Speed", fields["Identifications"])
+        self.assertIn("Base Damage", fields["Base stats"])
+        self.assertIn("Deal more damage", fields["Other details"])
+        self.assertIn("Example_Blade", fields["Other details"])
+        self.assertIn("model data: 42", fields["Other details"])
+        self.assertEqual(fields["Lore"], "A sharp blade")
+
+    async def test_news_service_returns_latest_visible_articles(self) -> None:
+        class API:
+            async def get_latest_articles(self) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "title": "Older",
+                        "visible": True,
+                        "published_at": "2025-01-01T00:00:00Z",
+                    },
+                    {
+                        "title": "Hidden",
+                        "visible": False,
+                        "published_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "title": "Newer",
+                        "visible": True,
+                        "published_at": "2026-01-01T00:00:00Z",
+                    },
+                ]
+
+        latest = await NewsService(API()).latest(limit=1)  # type: ignore[arg-type]
+        self.assertEqual([article["title"] for article in latest], ["Newer"])
+        self.assertEqual(ItemCommands.item.name, "item")
+        self.assertIsNotNone(NewsCommands.news.get_command("latest"))
+
+
+class PresentationTests(unittest.IsolatedAsyncioTestCase):
     async def test_member_and_territory_pagination(self) -> None:
         rows = [
             {"username": f"Player{index}", "rank": "recruit", "contributed": index}
             for index in range(23)
         ]
         directory = MemberDirectoryView(rows, "Test", 0x123456)
-        self.assertEqual(len(directory.make_embed().description.splitlines()), 10)
+        lines = directory.make_embed().description.splitlines()
+        self.assertEqual(len(lines[2:-1]), 10)
+        self.assertTrue(lines[0].startswith("```"))
+        self.assertIn("0", lines[2])
+        self.assertIn("NIL", lines[2])
         directory.rank = "chief"
         self.assertEqual(directory.filtered, [])
-        self.assertEqual(directory.make_embed().description, "No members match this filter.")
+        self.assertEqual(directory.make_embed().description, "NIL")
+
+    async def test_member_directory_aligns_columns_and_shows_status(self) -> None:
+        directory = MemberDirectoryView(
+            [
+                {
+                    "username": "A",
+                    "rank": "recruit",
+                    "contributed": 8887,
+                    "online": True,
+                },
+                {
+                    "username": "LongerPlayer",
+                    "rank": "chief",
+                    "contributed": 108001759,
+                    "online": False,
+                },
+            ],
+            "Test",
+            0x123456,
+        )
+        lines = directory.make_embed().description.splitlines()
+        header = lines[1]
+        for header_label, row_value in (("RANK", "Recruit"), ("ONLINE / OFFLINE", "Online")):
+            self.assertEqual(header.index(header_label), lines[2].index(row_value))
+        self.assertEqual(
+            header.index("CONTRIBUTION") + len("CONTRIBUTION"),
+            lines[2].index("8,887") + len("8,887"),
+        )
+        self.assertTrue(lines[2].endswith("Online"))
+        self.assertTrue(lines[3].endswith("Offline"))
 
         territories = TerritoryView(
             [(f"Territory{index}", {}) for index in range(23)], "Test", 0x123456
         )
         self.assertEqual(len(territories.make_embed().fields), 11)
+        self.assertIn("NIL", territories.make_embed().fields[0].value)
         territories.page = 2
         self.assertEqual(len(territories.make_embed().fields), 1)
+        empty_territories = TerritoryView([], "Test", 0x123456)
+        self.assertEqual(empty_territories.make_embed().description, "NIL")
+
+    def test_embed_uses_compact_footer_without_api_version(self) -> None:
+        embed = base_embed("Test", 0x123456)
+        self.assertNotIn("API", embed.footer.text)
+        self.assertIn("Updated", embed.footer.text)
 
     def test_refresh_requires_manage_server(self) -> None:
-        refresh = GuildCommands.guild.get_command("refresh")
+        refresh = guild.get_command("refresh")
         self.assertIsNotNone(refresh.default_permissions)
         self.assertTrue(refresh.default_permissions.manage_guild)
-        self.assertEqual(format_number(None), "Not available")
+        self.assertEqual(format_number(None), "NIL")
+        self.assertIsNone(guild.get_command("history"))
+        self.assertNotIn(
+            "weekly_contribution",
+            {
+                choice.value
+                for choice in guild.get_command("leaderboard")._params[
+                    "category"
+                ].choices
+            },
+        )
 
     async def test_slow_command_defers_before_fetching_api_data(self) -> None:
         events: list[str] = []
@@ -204,12 +376,53 @@ class PersistenceAndPresentationTests(unittest.IsolatedAsyncioTestCase):
                 )(),
             },
         )()
-        cog = GuildCommands(None, Service(), test_settings())  # type: ignore[arg-type]
+        client = SimpleNamespace(guild_service=Service(), settings=test_settings())
+        interaction.client = client
 
-        await GuildCommands.info.callback(cog, interaction)
+        await guild.get_command("info").callback(interaction)
 
         self.assertEqual(events, ["defer", "fetch"])
         interaction.followup.send.assert_awaited_once()
+
+    async def test_guild_info_lists_item_and_news_tools(self) -> None:
+        class Service:
+            async def current(self) -> dict[str, Any]:
+                return {
+                    "name": "Example Guild",
+                    "prefix": "EXG",
+                    "level": 20,
+                    "xpPercent": 40,
+                    "members": {"total": 1},
+                    "online": 0,
+                    "territories": 0,
+                    "wars": 0,
+                    "raids": 0,
+                }
+
+            async def owned_territories(self) -> dict[str, Any]:
+                return {}
+
+        interaction = type(
+            "Interaction",
+            (),
+            {
+                "response": type("Response", (), {"defer": AsyncMock()})(),
+                "followup": type(
+                    "Followup", (), {"send": AsyncMock()}
+                )(),
+            },
+        )()
+        interaction.client = SimpleNamespace(
+            guild_service=Service(),
+            settings=test_settings(),
+        )
+
+        await guild.get_command("info").callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        tools = next(field.value for field in embed.fields if field.name == "Companion tools")
+        self.assertIn("/item name", tools)
+        self.assertIn("/news latest", tools)
 
 
 if __name__ == "__main__":

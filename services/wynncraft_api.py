@@ -49,6 +49,26 @@ class WynncraftAPI:
             raise WynncraftAPIError("Wynncraft returned an unexpected player response.")
         return payload
 
+    async def search_items(self, query: str) -> list[dict[str, Any]]:
+        payload = await self.get(f"/item/search/{quote(query, safe='')}")
+        if not isinstance(payload, list) or any(
+            not isinstance(item, dict) for item in payload
+        ):
+            raise WynncraftAPIError("Wynncraft returned an unexpected item response.")
+        return payload
+
+    async def get_latest_articles(self) -> list[dict[str, Any]]:
+        payload = await self.get(
+            "/publisher/articles/list/article",
+            params={"page": "1"},
+        )
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, dict) or any(
+            not isinstance(article, dict) for article in results.values()
+        ):
+            raise WynncraftAPIError("Wynncraft returned an unexpected news response.")
+        return list(results.values())
+
     async def get_territories(self) -> dict[str, Any]:
         payload = await self.get("/guild/list/territory")
         if not isinstance(payload, dict):

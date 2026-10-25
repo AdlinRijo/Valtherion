@@ -1,16 +1,18 @@
-import asyncio
+import importlib
 import logging
+import pkgutil
 from logging.handlers import RotatingFileHandler
 
-import aiosqlite
 import discord
 from discord.ext import commands
 
-from commands.guild import GuildCommands
+import commands as command_modules
+
 from config import settings
-from database.database import Database
 from services.guild_service import GuildService
-from services.wynncraft_api import WynncraftAPI, WynncraftAPIError
+from services.wynncraft_api import WynncraftAPI
+
+logger = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
@@ -37,45 +39,23 @@ class GuildCompanionBot(commands.Bot):
             intents=discord.Intents.default(),
         )
         self.api = WynncraftAPI(settings)
-        self.database = Database(settings.database_path)
-        self.guild_service = GuildService(self.api, self.database, settings)
-        self.snapshot_task: asyncio.Task | None = None
+        self.guild_service = GuildService(self.api)
+        self.settings = settings
 
     async def setup_hook(self) -> None:
         await self.api.start()
-        await self.database.initialize()
-        await self.add_cog(GuildCommands(self, self.guild_service, settings))
-        await self.tree.sync()
-        if settings.guild_configured:
-            self.snapshot_task = asyncio.create_task(self._daily_snapshots())
-        else:
-            logging.getLogger(__name__).warning(
-                "Daily snapshots are disabled until a real GUILD_NAME is set in .env."
+        for module_info in pkgutil.iter_modules(command_modules.__path__):
+            module = importlib.import_module(
+                f"{command_modules.__name__}.{module_info.name}"
             )
-
-    async def _daily_snapshots(self) -> None:
-        while not self.is_closed():
-            try:
-                await self.guild_service.capture_snapshot()
-            except WynncraftAPIError as exc:
-                logging.getLogger(__name__).warning(
-                    "Guild snapshot skipped: %s", exc
-                )
-            except aiosqlite.Error as exc:
-                logging.getLogger(__name__).error(
-                    "Guild snapshot could not be saved: %s", exc
-                )
-            await asyncio.sleep(24 * 60 * 60)
+            setup = getattr(module, "setup", None)
+            if setup is not None:
+                await setup(self)
+        synced = await self.tree.sync()
+        logger.info("Synced %d global application commands.", len(synced))
 
     async def close(self) -> None:
-        if self.snapshot_task:
-            self.snapshot_task.cancel()
-            try:
-                await self.snapshot_task
-            except asyncio.CancelledError:
-                pass
         await self.api.close()
-        await self.database.close()
         await super().close()
 
 
